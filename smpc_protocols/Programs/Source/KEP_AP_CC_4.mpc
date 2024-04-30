@@ -1,0 +1,645 @@
+# coding: latin-1
+"""
+    Privacy-Preserving Protocol for Approximating the Kindey Exchange Problem with Exchange Cycles and Chains of Length 4
+"""
+
+from Compiler.types import sint, cint, regint, Array, MemValue, Matrix, MultiArray
+from Compiler.library import print_ln, do_while, for_range, if_, print_str, else_, for_range_parallel
+from Compiler.networking import write_output_to_clients, close_connections, setup_client_connections
+from Compiler.util import if_else
+from Compiler.comp_gate import compute_comp_matrix, read_input, compute_prio_matrix, read_prio_input, read_altruist_bits
+from Compiler.library import time, start_timer, stop_timer
+
+import math
+from itertools import permutations, combinations
+
+program.use_edabit(True)
+program.use_split(3)
+
+DEBUG = True
+
+PORT_NUM = 14000
+
+NUM_NODES = 4
+N = NUM_NODES
+MAX_CYCLE_SIZE = 3
+MAX_CHAIN_SIZE = 4
+MAX_CYCLES_PER_SUBSET = 2
+MAX_CHAINS_PER_SUBSET = 24
+MAX_STRUCTURES_PER_SUBSET = MAX_CHAINS_PER_SUBSET
+CHAINS_PER_SUBSET_TWO = 2
+CHAINS_PER_SUBSET_THREE = 6
+S_LENGTH = 11
+S_LENGTH_TWO = 6
+S_LENGTH_THREE = 4
+S_LENGTH_FOUR = 1
+
+Superset = tuple(range(0, NUM_NODES))
+S = [list(s) for i in range(2, MAX_CHAIN_SIZE + 1) for s in combinations(Superset, i)]  # All possible subsets
+
+CHAINS = []
+for s in S:
+    CHAINS_PER_SET = []
+    for i in permutations(s):
+        CHAINS_PER_SET.append(list(i))
+    CHAINS.append(CHAINS_PER_SET)
+
+for s in S:
+    while len(s) < MAX_CHAIN_SIZE:
+        s.append(NUM_NODES)
+
+
+###### HELPER FUNCTIONS ######
+
+
+def create_subsets():
+    subsets = Matrix(S_LENGTH, MAX_CHAIN_SIZE, cint)
+    counter = Array(1, cint)
+    counter[0] = regint(0)
+
+    @for_range(NUM_NODES)
+    def _(i):
+        @for_range(NUM_NODES)
+        def _(j):
+            @if_(j > i)
+            def _():
+                subsets[counter[0]][0] = i
+                subsets[counter[0]][1] = j
+                subsets[counter[0]][2] = NUM_NODES
+                counter[0] = counter[0] + 1
+
+    @for_range(NUM_NODES)
+    def _(i):
+        @for_range(NUM_NODES)
+        def _(j):
+            @if_(j > i)
+            def _():
+                @for_range(NUM_NODES)
+                def _(k):
+                    @if_(k > j)
+                    def _():
+                        subsets[counter[0]][0] = i
+                        subsets[counter[0]][1] = j
+                        subsets[counter[0]][2] = k
+                        counter[0] = counter[0] + 1
+
+    @for_range(NUM_NODES)
+    def _(i):
+        @for_range(NUM_NODES)
+        def _(j):
+            @if_(j > i)
+            def _():
+                @for_range(NUM_NODES)
+                def _(k):
+                    @if_(k > j)
+                    def _():
+                        @for_range(NUM_NODES)
+                        def _(l):
+                            @if_(l > k)
+                            def _():
+                                subsets[counter[0]][0] = i
+                                subsets[counter[0]][1] = j
+                                subsets[counter[0]][2] = k
+                                subsets[counter[0]][3] = l
+                                counter[0] = counter[0] + 1
+
+    return subsets
+
+
+def demux(x):
+    n = len(x)
+    res = Array(2 ** n, type(x[0]))
+    if n == 0:
+        res[0] = 1
+    if n == 1:
+        res[0] = 1 - x[0]
+        res[1] = x[0]
+    else:
+        a = Array(2 ** (n // 2), type(x[0]))
+        a.assign(demux(x[:n // 2]))
+        b = Array(2 ** (n - n // 2), type(x[0]))
+        b.assign(demux(x[n // 2:]))
+
+        @for_range_parallel(len(a) * len(b), [len(a), len(b)])
+        def _(i, j):
+            res[j * len(a) + i] = a[i].bit_and(b[j])
+    return res
+
+
+def get_indicator_for_index(index: sint, n: int):
+    index_decomposition = index.bit_decompose(n.bit_length(), maybe_mixed=False)  # TODO mixed=True and daBit?
+    return demux(index_decomposition)
+
+
+def get_index_of_max_value(n, indices, values):
+    """
+    Binary tree reduction approach for computing the index of the cycle or chain of maximum weight for a subset.
+    """
+    if n == 1:
+        return if_else(values[0] > 0, indices[0], MAX_STRUCTURES_PER_SUBSET)
+    else:
+        new_n = math.ceil(n / 2)
+        decisions = math.floor(n / 2)
+        new_indices = Array(new_n, sint)
+        new_values = Array(new_n, sint)
+
+        @for_range_parallel(decisions, decisions)
+        def _(i):
+            select_first = values[2 * i] >= values[2 * i + 1]
+            new_indices[i] = if_else(select_first, indices[2 * i], indices[2 * i + 1])
+            new_values[i] = if_else(select_first, values[2 * i], values[2 * i + 1])
+
+        if new_n > decisions:
+            new_indices[new_n - 1] = indices[n - 1]
+            new_values[new_n - 1] = values[n - 1]
+
+        return get_index_of_max_value(new_n, new_indices, new_values)
+
+
+def print_matrix(matrix, rows, cols):
+    @for_range(rows)
+    def _(i):
+        @for_range(cols)
+        def _(j):
+            print_str("%s ", matrix[i][j].reveal())
+
+        print_ln(" ")
+
+
+###### IMPLEMENTATION OF THE DIFFERENT PHASES OF THE PROTOCOL ######
+
+def setup_phase(adj_matrix, prio_matrix, altruists):
+    """
+    Compute the weight for each subset and store the corresponding cycle of maximum weight for each subset.
+    """
+    potential_subsets = Array(S_LENGTH, sint)
+    potential_subsets.assign_all(0)
+
+    # A subset {u, v, w, x} of size 4 can yield a maximum of 24 different chains
+    prio_mapping = Matrix(S_LENGTH, MAX_STRUCTURES_PER_SUBSET, sint)
+    prio_mapping.assign_all(0)
+
+    # The weight of a cycle is computed in two parts. First, we determine if the cycle is executable given the current
+    # compatibility graph, i.e., we compute the product of the entries for each edge in the adjacency matrix. Then, we
+    # multiply this product with the actual weight of the cycle which corresponds to the sum of the entries for its
+    # edges in the prioritization matrix.
+    @for_range_parallel(S_LENGTH_TWO, S_LENGTH_TWO)
+    def _(i):
+        u, v, w, x = S[i]
+        prio_mapping[i][0] = adj_matrix[u][v] * adj_matrix[v][u] * (prio_matrix[u][v] + prio_matrix[v][u])
+        prio_mapping[i][1] = sint(0)
+
+    @for_range_parallel(S_LENGTH_THREE, S_LENGTH_THREE)
+    def _(i):
+        u, v, w, x = S[i + S_LENGTH_TWO]
+        prio_mapping[i + S_LENGTH_TWO][0] = adj_matrix[u][v] * adj_matrix[v][w] * adj_matrix[w][u] * (
+                prio_matrix[u][v] + prio_matrix[v][w] + prio_matrix[w][u])
+        prio_mapping[i + S_LENGTH_TWO][1] = adj_matrix[u][w] * adj_matrix[w][v] * adj_matrix[v][u] * (
+                prio_matrix[u][w] + prio_matrix[w][v] + prio_matrix[v][u])
+
+    # The weight computation for a chain is analogous to the computation for a cycle with the exception that we have to
+    # additionally check whether the first node in the chain is an altruistic donor.
+    @for_range_parallel(S_LENGTH_TWO, S_LENGTH_TWO)
+    def _(i):
+        @for_range_parallel(CHAINS_PER_SUBSET_TWO, CHAINS_PER_SUBSET_TWO)
+        def _(j):
+            u, v = CHAINS[i][j]
+            prio_mapping[i][j + 2] = altruists[u] * adj_matrix[u][v] * prio_matrix[u][v]
+
+        @for_range_parallel(MAX_STRUCTURES_PER_SUBSET - CHAINS_PER_SUBSET_TWO - 2,
+                            MAX_STRUCTURES_PER_SUBSET - CHAINS_PER_SUBSET_TWO - 2)
+        def _(j):
+            prio_mapping[i][2 + CHAINS_PER_SUBSET_TWO + j] = sint(0)
+
+    @for_range_parallel(S_LENGTH_THREE, S_LENGTH_THREE)
+    def _(i):
+        @for_range_parallel(CHAINS_PER_SUBSET_THREE, CHAINS_PER_SUBSET_THREE)
+        def _(j):
+            u, v, w = CHAINS[i + S_LENGTH_TWO][j]
+            prio_mapping[i + S_LENGTH_TWO][2 + j] = altruists[u] * adj_matrix[u][v] * adj_matrix[v][w] * (
+                    prio_matrix[u][v] + prio_matrix[v][w])
+
+        @for_range_parallel(MAX_STRUCTURES_PER_SUBSET - CHAINS_PER_SUBSET_THREE - 2,
+                            MAX_STRUCTURES_PER_SUBSET - CHAINS_PER_SUBSET_THREE - 2)
+        def _(j):
+            prio_mapping[i][2 + CHAINS_PER_SUBSET_THREE + j] = sint(0)
+
+    @for_range_parallel(S_LENGTH_FOUR, S_LENGTH_FOUR)
+    def _(i):
+        @for_range_parallel(MAX_CHAINS_PER_SUBSET, MAX_CHAINS_PER_SUBSET)
+        def _(j):
+            u, v, w, x = CHAINS[i + S_LENGTH_TWO + S_LENGTH_THREE][j]
+            prio_mapping[i + S_LENGTH_TWO + S_LENGTH_THREE][j] = altruists[u] * adj_matrix[u][v] * adj_matrix[v][w] * \
+                                                                 adj_matrix[w][x] * (
+                                                                         prio_matrix[u][v] + prio_matrix[v][w] +
+                                                                         prio_matrix[w][x])
+
+    # In the following, we determine the cycle or chain of maximum weight for each subset of nodes. To this end, we
+    # first generate the vector "indices" that simply contains all indices of the cycles and chains for a subset.
+    indices = Array(MAX_STRUCTURES_PER_SUBSET, sint)
+
+    @for_range_parallel(MAX_STRUCTURES_PER_SUBSET, MAX_STRUCTURES_PER_SUBSET)
+    def _(i):
+        indices[i] = sint(i)
+
+    # The matrix "mapping" stores the mapping between subsets and the index of the maximum weight cycle or chain per
+    # subset.
+    mapping = Matrix(S_LENGTH, MAX_STRUCTURES_PER_SUBSET, sint)
+
+    # We first use a binary tree reduction approach to determine the index of the cycle or chain of maximum weight. This
+    # gate follows the same approach as the gate for computing the maximum weight subset. Then we compute a binary
+    # indicator vector for this index and store the resulting vector as the corresponding row of the secret subset map.
+    # Finally, we store the weight of each subset in the vector "potential subsets".
+    @for_range_parallel(S_LENGTH, S_LENGTH)
+    def _(i):
+        max_index = get_index_of_max_value(MAX_STRUCTURES_PER_SUBSET, indices, prio_mapping[i])
+        indicator = get_indicator_for_index(max_index, MAX_STRUCTURES_PER_SUBSET)
+        mapping[i] = indicator[:MAX_STRUCTURES_PER_SUBSET]
+        potential_subsets[i] = sint.dot_product(mapping[i], prio_mapping[i])
+
+    return potential_subsets, mapping
+
+
+def max_weight_subset(n, indices, nodes, weights):
+    """
+    Set of n subsets encoded by a secret vector of subset indices, a secret matrix encoding the nodes of each subset,
+    and a secret vector storing the weight of each subset.
+    Returns the secret index of the first subset of maximum weight and the corresponding nodes of the chosen subset. If
+    there is no subset of weight larger than 0, the dummy index S_LENGTH with the dummy nodes (NUM_NODES, NUM_NODES,
+    NUM_NODES, NUM_NODES) is returned.
+    The gate uses a recursive tree reduction approach to save communication rounds.
+    """
+    # if the set only contains a single subset, we know that we have found a subset of maximum weight
+    if n == 1:
+        valid = weights[0] > 0
+        index = valid.if_else(indices[0], S_LENGTH)
+        u = valid.if_else(nodes[0][0], NUM_NODES)
+        v = valid.if_else(nodes[0][1], NUM_NODES)
+        w = valid.if_else(nodes[0][2], NUM_NODES)
+        x = valid.if_else(nodes[0][3], NUM_NODES)
+        return index, u, v, w, x
+
+    # initialize the data structures for the new set of subsets which has only half of the size of the current set
+    n_prime = math.ceil(n / 2)
+    indices_prime = Array(n_prime, sint)
+    nodes_prime = Matrix(n_prime, MAX_CHAIN_SIZE, sint)
+    weights_prime = Array(n_prime, sint)
+
+    # in each iteration, we compare two neighboring subsets and store the subset of larger weight
+    iterations = math.floor(n / 2)
+
+    @for_range_parallel(iterations, iterations)
+    def _(i):
+        select_first = weights[2 * i] >= weights[2 * i + 1]
+        indices_prime[i] = if_else(select_first, indices[2 * i], indices[2 * i + 1])
+        nodes_prime[i][0] = if_else(select_first, nodes[2 * i][0], nodes[2 * i + 1][0])
+        nodes_prime[i][1] = if_else(select_first, nodes[2 * i][1], nodes[2 * i + 1][1])
+        nodes_prime[i][2] = if_else(select_first, nodes[2 * i][2], nodes[2 * i + 1][2])
+        nodes_prime[i][3] = if_else(select_first, nodes[2 * i][3], nodes[2 * i + 1][3])
+        weights_prime[i] = if_else(select_first, weights[2 * i], weights[2 * i + 1])
+
+    # if the current set of subsets is of odd size, we just store the last entry of the current set as the last entry
+    # of the new set
+    if n_prime > iterations:
+        indices_prime[n_prime - 1] = indices[n - 1]
+        nodes_prime[n_prime - 1] = nodes[n - 1]
+        weights_prime[n_prime - 1] = weights[n - 1]
+
+    return max_weight_subset(n_prime, indices_prime, nodes_prime, weights_prime)
+
+
+def resolution_phase(x_prime, mapping, subset_indices_to_vertices):
+    """
+    Transform the vector of chosen subsets into a solution matrix where each entry solution_matrix[i][j] encodes
+    whether the donor of patient-donor pair or altruistic donor i donates a kidney to the patient of pair j.
+    """
+    solution_matrix = Matrix(NUM_NODES, NUM_NODES, sint)
+    solution_matrix.assign_all(0)
+
+    # y[i][j] indicates whether cycle or chain C[i][j] with vertex set V(C[i][j]) = S[i] is among the chosen exchange
+    # cycles and chains. This is the case iff chosen_sets = 1 (set S[i] is chosen) and mapping[i][j] = 1 (C[i][j]
+    # is chosen).
+    y = Matrix(S_LENGTH, MAX_STRUCTURES_PER_SUBSET, sint)
+
+    @for_range_parallel(S_LENGTH, S_LENGTH)
+    def _(k):
+        @for_range_parallel(MAX_STRUCTURES_PER_SUBSET, MAX_STRUCTURES_PER_SUBSET)
+        def _(l):
+            y[k][l] = x_prime[k] * mapping[k][l]
+
+    @for_range_parallel(S_LENGTH_TWO, S_LENGTH_TWO)
+    def _(s):
+        u, v, w, x = S[s]
+        solution_matrix[u][v] = solution_matrix[u][v] + y[s][0]
+        solution_matrix[v][u] = solution_matrix[v][u] + y[s][0]
+
+    # Transform the chosen exchange cycles and chains (with y[i][j] = 1) into the edges that make up the exchange.
+    @for_range_parallel(S_LENGTH_TWO, S_LENGTH_TWO)
+    def _(s):
+        @for_range_parallel(2, 2)
+        def _(c):
+            u, v = CHAINS[s][c]
+            solution_matrix[u][v] = solution_matrix[u][v] + y[s][2 + c]
+
+    @for_range(S_LENGTH_THREE)
+    def _(s):
+        u, v, w, x = subset_indices_to_vertices[s + S_LENGTH_TWO]
+        # CYCLE (u, v, w)
+        solution_matrix[u][v] = solution_matrix[u][v] + y[s + S_LENGTH_TWO][0]
+        solution_matrix[v][w] = solution_matrix[v][w] + y[s + S_LENGTH_TWO][0]
+        solution_matrix[w][u] = solution_matrix[w][u] + y[s + S_LENGTH_TWO][0]
+        # CYCLE (u, w, v)
+        solution_matrix[u][w] = solution_matrix[u][w] + y[s + S_LENGTH_TWO][1]
+        solution_matrix[w][v] = solution_matrix[w][v] + y[s + S_LENGTH_TWO][1]
+        solution_matrix[v][u] = solution_matrix[v][u] + y[s + S_LENGTH_TWO][1]
+        # CHAIN u -> v -> w
+        solution_matrix[u][v] = solution_matrix[u][v] + y[s + S_LENGTH_TWO][2]
+        solution_matrix[v][w] = solution_matrix[v][w] + y[s + S_LENGTH_TWO][2]
+        # CHAIN u -> w -> v
+        solution_matrix[u][w] = solution_matrix[u][w] + y[s + S_LENGTH_TWO][3]
+        solution_matrix[w][v] = solution_matrix[w][v] + y[s + S_LENGTH_TWO][3]
+        # CHAIN v -> u -> w
+        solution_matrix[v][u] = solution_matrix[v][u] + y[s + S_LENGTH_TWO][4]
+        solution_matrix[u][w] = solution_matrix[u][w] + y[s + S_LENGTH_TWO][4]
+        # CHAIN v -> w -> u
+        solution_matrix[v][w] = solution_matrix[v][w] + y[s + S_LENGTH_TWO][5]
+        solution_matrix[w][u] = solution_matrix[w][u] + y[s + S_LENGTH_TWO][5]
+        # CHAIN w -> u -> v
+        solution_matrix[w][u] = solution_matrix[w][u] + y[s + S_LENGTH_TWO][6]
+        solution_matrix[u][v] = solution_matrix[u][v] + y[s + S_LENGTH_TWO][6]
+        # CHAIN w -> v -> u
+        solution_matrix[w][v] = solution_matrix[w][v] + y[s + S_LENGTH_TWO][7]
+        solution_matrix[v][u] = solution_matrix[v][u] + y[s + S_LENGTH_TWO][7]
+
+    @for_range(S_LENGTH_FOUR)
+    def _(s):
+        u, v, w, x = subset_indices_to_vertices[s + S_LENGTH_TWO + S_LENGTH_THREE]
+        # CHAIN u -> v -> w -> x
+        solution_matrix[u][v] = solution_matrix[u][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][0]
+        solution_matrix[v][w] = solution_matrix[v][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][0]
+        solution_matrix[w][x] = solution_matrix[w][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][0]
+        # CHAIN u -> v -> x -> w
+        solution_matrix[u][v] = solution_matrix[u][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][1]
+        solution_matrix[v][x] = solution_matrix[v][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][1]
+        solution_matrix[x][w] = solution_matrix[x][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][1]
+        # CHAIN u -> w -> v -> x
+        solution_matrix[u][w] = solution_matrix[u][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][2]
+        solution_matrix[w][v] = solution_matrix[w][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][2]
+        solution_matrix[v][x] = solution_matrix[v][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][2]
+        # CHAIN u -> w -> x -> v
+        solution_matrix[u][w] = solution_matrix[u][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][3]
+        solution_matrix[w][x] = solution_matrix[w][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][3]
+        solution_matrix[x][v] = solution_matrix[x][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][3]
+        # CHAIN u -> x -> v -> w
+        solution_matrix[u][x] = solution_matrix[u][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][4]
+        solution_matrix[x][v] = solution_matrix[x][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][4]
+        solution_matrix[v][w] = solution_matrix[v][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][4]
+        # CHAIN u -> x -> w -> v
+        solution_matrix[u][x] = solution_matrix[u][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][5]
+        solution_matrix[x][w] = solution_matrix[x][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][5]
+        solution_matrix[w][v] = solution_matrix[w][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][5]
+
+        # CHAIN v -> u -> w -> x
+        solution_matrix[v][u] = solution_matrix[v][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][6]
+        solution_matrix[u][w] = solution_matrix[u][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][6]
+        solution_matrix[w][x] = solution_matrix[w][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][6]
+        # CHAIN v -> u -> x -> w
+        solution_matrix[v][u] = solution_matrix[v][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][7]
+        solution_matrix[u][x] = solution_matrix[u][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][7]
+        solution_matrix[x][w] = solution_matrix[x][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][7]
+        # CHAIN v -> w -> u -> x
+        solution_matrix[v][w] = solution_matrix[v][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][8]
+        solution_matrix[w][u] = solution_matrix[w][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][8]
+        solution_matrix[u][x] = solution_matrix[u][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][8]
+        # CHAIN v -> w -> x -> u
+        solution_matrix[v][w] = solution_matrix[v][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][9]
+        solution_matrix[w][x] = solution_matrix[w][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][9]
+        solution_matrix[x][u] = solution_matrix[x][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][9]
+        # CHAIN v -> x -> u -> w
+        solution_matrix[v][x] = solution_matrix[v][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][10]
+        solution_matrix[x][u] = solution_matrix[x][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][10]
+        solution_matrix[u][w] = solution_matrix[u][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][10]
+        # CHAIN v -> x -> w -> u
+        solution_matrix[v][x] = solution_matrix[v][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][11]
+        solution_matrix[x][w] = solution_matrix[x][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][11]
+        solution_matrix[w][u] = solution_matrix[w][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][11]
+
+        # CHAIN w -> u -> v -> x
+        solution_matrix[w][u] = solution_matrix[w][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][12]
+        solution_matrix[u][v] = solution_matrix[u][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][12]
+        solution_matrix[v][x] = solution_matrix[v][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][12]
+        # CHAIN w -> u -> x -> v
+        solution_matrix[w][u] = solution_matrix[w][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][13]
+        solution_matrix[u][x] = solution_matrix[u][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][13]
+        solution_matrix[x][v] = solution_matrix[x][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][13]
+        # CHAIN w -> v -> u -> x
+        solution_matrix[w][v] = solution_matrix[w][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][14]
+        solution_matrix[v][u] = solution_matrix[v][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][14]
+        solution_matrix[u][x] = solution_matrix[u][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][14]
+        # CHAIN w -> v -> x -> u
+        solution_matrix[w][v] = solution_matrix[w][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][15]
+        solution_matrix[v][x] = solution_matrix[v][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][15]
+        solution_matrix[x][u] = solution_matrix[x][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][15]
+        # CHAIN w -> x -> u -> v
+        solution_matrix[w][x] = solution_matrix[w][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][16]
+        solution_matrix[x][u] = solution_matrix[x][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][16]
+        solution_matrix[u][v] = solution_matrix[u][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][16]
+        # CHAIN w -> x -> v -> u
+        solution_matrix[w][x] = solution_matrix[w][x] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][17]
+        solution_matrix[x][v] = solution_matrix[x][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][17]
+        solution_matrix[v][u] = solution_matrix[v][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][17]
+
+        # CHAIN x -> u -> v -> w
+        solution_matrix[x][u] = solution_matrix[x][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][18]
+        solution_matrix[u][v] = solution_matrix[u][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][18]
+        solution_matrix[v][w] = solution_matrix[v][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][18]
+        # CHAIN x -> u -> w -> v
+        solution_matrix[x][u] = solution_matrix[x][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][19]
+        solution_matrix[u][w] = solution_matrix[u][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][19]
+        solution_matrix[w][v] = solution_matrix[w][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][19]
+        # CHAIN x -> v -> u -> w
+        solution_matrix[x][v] = solution_matrix[x][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][20]
+        solution_matrix[v][u] = solution_matrix[v][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][20]
+        solution_matrix[u][w] = solution_matrix[u][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][20]
+        # CHAIN x -> v -> w -> u
+        solution_matrix[x][v] = solution_matrix[x][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][21]
+        solution_matrix[v][w] = solution_matrix[v][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][21]
+        solution_matrix[w][u] = solution_matrix[w][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][21]
+        # CHAIN x -> w -> u -> v
+        solution_matrix[x][w] = solution_matrix[x][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][22]
+        solution_matrix[w][u] = solution_matrix[w][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][22]
+        solution_matrix[u][v] = solution_matrix[u][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][22]
+        # CHAIN x -> w -> v -> u
+        solution_matrix[x][w] = solution_matrix[x][w] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][23]
+        solution_matrix[w][v] = solution_matrix[w][v] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][23]
+        solution_matrix[v][u] = solution_matrix[v][u] + y[s + S_LENGTH_TWO + S_LENGTH_THREE][23]
+
+    return solution_matrix
+
+
+def decryption_phase(solution_matrix):
+    """
+    Perform the mapping from the solution matrix to the exchange partners of each patient-donor pair or altruistic donor.
+    """
+    donors = Array(NUM_NODES, sint)
+    recipients = Array(NUM_NODES, sint)
+
+    donor = Array(1, sint)
+    recipient = Array(1, sint)
+
+    @for_range(NUM_NODES)
+    def _(i):
+        donor[0] = sint(0)
+        recipient[0] = sint(0)
+
+        @for_range(NUM_NODES)
+        def _(j):
+            donor[0] = donor[0] + (j + 1) * solution_matrix[j][i]
+            recipient[0] = recipient[0] + (j + 1) * solution_matrix[i][j]
+
+        donors[i] = donor[0]
+        recipients[i] = recipient[0]
+
+    return donors, recipients
+
+
+###### MAIN PROTOCOL ######
+
+def main():
+    """
+    First receive the input from all hospitals. Then start with the execution of the actual kidney exchange protocol.
+    """
+
+    number_clients, client_sockets = setup_client_connections(PORT_NUM, NUM_NODES)
+
+    # PRE-COMPUTATION PHASE
+    # Create a mapping from the subset index to the vertices of the subset.
+    subset_index_to_vertices = create_subsets()
+
+    # Initialize the vector of subset indices and the matrix of nodes for each subset.
+    subset_indices = Array(S_LENGTH, cint)
+    subset_nodes = Matrix(S_LENGTH, MAX_CHAIN_SIZE, cint)
+
+    @for_range_parallel(S_LENGTH, S_LENGTH)
+    def _(s):
+        subset_indices[s] = cint(s)
+        u, v, w, x = S[s]
+        subset_nodes[s][0] = cint(u)
+        subset_nodes[s][1] = cint(v)
+        subset_nodes[s][2] = cint(w)
+        subset_nodes[s][3] = cint(x)
+
+    # Start of protocol KEP_AP_CC_4
+    print_ln("Start Time")
+    time()
+
+    # Obtain input for construction of adjacency matrix and prioritization matrix from the patient-donor pairs and altruistic donors.
+    start_timer(1)
+    blood_donor, blood_patient, antigen_donor, antigen_patient = read_input(NUM_NODES)
+    altruists = read_altruist_bits(NUM_NODES)
+    prescores, patient_antigens, donor_antigens, patient_center, donor_center = read_prio_input(NUM_NODES)
+    stop_timer(1)
+
+    # CONSTRUCTION PHASE
+    start_timer(2)
+    adjacency_matrix = compute_comp_matrix(blood_donor, blood_patient, antigen_donor, antigen_patient, NUM_NODES)
+    prio_matrix = compute_prio_matrix(prescores, patient_antigens, donor_antigens, patient_center, donor_center,
+                                      NUM_NODES)
+    if DEBUG:
+        print_ln("Adjacency Matrix:")
+        print_matrix(adjacency_matrix, NUM_NODES, NUM_NODES)
+        print_ln("Prioritization Matrix:")
+        print_matrix(prio_matrix, NUM_NODES, NUM_NODES)
+    stop_timer(2)
+
+    start_timer(3)
+    # Shuffle the adjacency matrix, the prioritization matrix, and the altruist indicator vector
+    permutation = sint.get_secure_shuffle(NUM_NODES)
+    adjacency_matrix.secure_permute(permutation)
+    adjacency_matrix = adjacency_matrix.transpose()
+    adjacency_matrix.secure_permute(permutation)
+    adjacency_matrix = adjacency_matrix.transpose()
+
+    prio_matrix.secure_permute(permutation)
+    prio_matrix = prio_matrix.transpose()
+    prio_matrix.secure_permute(permutation)
+    prio_matrix = prio_matrix.transpose()
+    altruists.secure_permute(permutation)
+    stop_timer(3)
+
+    # EVALUATION PHASE
+    start_timer(4)
+    # Initially no subset is chosen; so we set all entries of chosen_subsets to 0.
+    subset_weights = Array(S_LENGTH, sint)
+    chosen_subsets = Array(S_LENGTH, sint)
+    chosen_subsets.assign_all(0)
+    subset_weights, mapping = setup_phase(adjacency_matrix, prio_matrix, altruists)
+    stop_timer(4)
+
+    # OPTIMIZATION PHASE
+    start_timer(5)
+
+    # We have to execute NUM_NODES/2 iterations as in each iteration at least one subset of size 2 is chosen as
+    # long as there is a subset of weight larger than 0. Thus, NUM_NODES/2 is the worst case number of iterations
+    # that can be required. Executing dummy iterations even if there is no longer a subset of weight larger than 0
+    # makes our protocol entirely data oblivious.
+    @for_range(NUM_NODES // 2)
+    def _(iteration):
+        chosen_subset, u, v, w, x = max_weight_subset(S_LENGTH, subset_indices, subset_nodes, subset_weights)
+
+        # Compute the binary indicator vectors for the obtained index of the maximum weight subset and its nodes.
+        # If there was no subset of weight larger than 0, the index will be S_LENGTH (resp. NUM_NODES) and thus the
+        # computed binary indicator will contain only 0's.
+        indicator_subset = get_indicator_for_index(chosen_subset, S_LENGTH)
+        indicator_u = get_indicator_for_index(u, NUM_NODES)
+        indicator_v = get_indicator_for_index(v, NUM_NODES)
+        indicator_w = get_indicator_for_index(w, NUM_NODES)
+        indicator_x = get_indicator_for_index(x, NUM_NODES)
+
+        chosen_subsets[:S_LENGTH] = chosen_subsets[:S_LENGTH] + indicator_subset[:S_LENGTH]
+
+        @if_(iteration < NUM_NODES // 2 - 1)
+        def _():
+            # Obtain the combined indicator for the chosen subset; only include the indicator for the node w, if the
+            # chosen subset is at least of size 3, and only include the indicator for the node x, if the chosen subset
+            # is at least of size 4.
+            indicator = indicator_u + indicator_v + (1 - indicator_w[NUM_NODES]) * indicator_w + (
+                    1 - indicator_x[NUM_NODES]) * indicator_x
+
+            # Set the weight of all subsets that share a node with the chosen subset to 0.
+            @for_range_parallel(S_LENGTH, S_LENGTH)
+            def _(s):
+                a, b, c, d = S[s]
+                subset_weights[s] *= (1 - indicator[a]) * (1 - indicator[b]) * (1 - indicator[c]) * (
+                        1 - indicator[d])
+
+    stop_timer(5)
+
+    # RESOLUTION PHASE
+    start_timer(6)
+    solution_matrix = resolution_phase(chosen_subsets, mapping, subset_index_to_vertices)
+    stop_timer(6)
+
+    # Revert the initial shuffling of the adjacency matrix.
+    start_timer(7)
+    solution_matrix.secure_permute(permutation, reverse=True)
+    solution_matrix = solution_matrix.transpose()
+    solution_matrix.secure_permute(permutation, reverse=True)
+    solution_matrix = solution_matrix.transpose()
+
+    donors, recipients = decryption_phase(solution_matrix)
+    stop_timer(7)
+
+    start_timer(8)
+    # Provide the patient-donor pairs with their exchange partners.
+    write_output_to_clients(client_sockets, number_clients, donors)
+    write_output_to_clients(client_sockets, number_clients, recipients)
+    stop_timer(8)
+
+    print_ln("End Time")
+    time()
+
+    close_connections(NUM_NODES)
+
+
+main()
